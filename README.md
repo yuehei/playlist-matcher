@@ -1,43 +1,37 @@
 # Playlist Matcher for Navidrome
 
-## 简介
-本工具可帮助您将播放列表同步到Navidrome音乐服务器。支持从QQ音乐、网易云音乐和Apple Music导入歌单，并智能匹配Navidrome媒体库中的歌曲。
+## v2.0.0 更新说明
+- 从 CustomTkinter 桌面 GUI 重构为 Web 应用（Flask + SSE），浏览器中使用，无需安装桌面依赖
+- 代码分层：业务逻辑全部迁移至 `core.py`，新增 Flask 服务层 `app.py` 与单页面前端 `templates/index.html`
+- 日志、未匹配列表、弹窗告警通过 SSE 实时推送到浏览器
+- 媒体库导出/加载、匹配结果下载均通过浏览器文件下载完成
+- 新增 `.gitignore`
+- 移除 `customtkinter` 依赖，新增 `flask` 依赖
 
-## 主要功能
-- 支持三大音乐平台：QQ音乐、网易云音乐、Apple Music
-- 智能歌曲匹配（模糊匹配/完全匹配模式）
-- 自动创建并管理Navidrome歌单
+## 如何启动
 
-## 开发要求（均在项目根目录执行）
-1. Python 3.8+
-2. 依赖库安装:
+要求 Python 3.8+。
+
 ```bash
+# 创建虚拟环境（推荐）
+python3 -m venv .venv
+
+# 激活虚拟环境
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# 安装依赖
 pip install -r requirements.txt
-```
-3. 需要 chrome 和 chromedriver （用于支持Apple Music），可从 https://googlechromelabs.github.io/chrome-for-testing/ 下载，下载后解压到项目根目录
-4. 运行：
-```bash
-python playlist_matcher_navidrome.py
-```
-5. 打包：
-```bash
-pyinstaller --name "PlaylistMatcherNavidrome" --onedir --windowed --icon="icon.ico" --add-data "icon.ico;." --add-data "chrome-win64;chrome-win64" --add-data "chromedriver-win64;chromedriver-win64" playlist_matcher_navidrome.py
+
+# 启动
+python app.py
 ```
 
-## 使用方法如图
-![screenshot](./.imgs/screenshot.png)
+启动后会自动打开浏览器访问 http://127.0.0.1:5000 ；如需修改端口，先设置环境变量 `PORT` 再启动。
 
-## 说明
-- `Navidrome 媒体库数据`: 在连接 Navidrome才可使用，初次使用必须“扫描 Navidrome 全库”，扫描结束可选择“导出当前数据到文件”；后续可“浏览”选择数据库文件，然后“从文件加载数据”
-- `输出与服务器操作`: 可不选择结果保存位置，默认保存在软件当前目录
+> Apple Music 歌单导入依赖本机 Chrome 浏览器与 chromedriver；QQ 音乐、网易云音乐无此要求。
 
-## 支持的播放列表来源
-1. QQ音乐：支持通过URL或ID导入
-2. 网易云音乐：支持通过URL或ID导入
-3. Apple Music：支持通过URL或播放列表ID导入
+![使用截图](.imgs/screenshot.png)
 
-## 贡献指南
-欢迎提交Issue和PR！请遵循PEP8代码规范。
+---
 
-## 许可证
-MIT License
+本项目 Fork 自 [CTZZG/playlist-matcher](https://github.com/CTZZG/playlist-matcher)。

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ app_name }} - v{{ version }}</title>
+<style>
+:root {
+  --blue: #1f6aa5;
+  --blue-dark: #185a8c;
+  --bg: #f2f4f8;
+  --card: #ffffff;
+  --border: #d9dee6;
+  --text: #1c2733;
+  --muted: #5a6a7a;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+}
+header {
+  background: var(--blue);
+  color: #fff;
+  padding: 10px 20px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex: none;
+}
+header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+header span { font-size: 12px; opacity: .85; }
+.layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 12px;
+  padding: 12px;
+}
+.left { display: flex; flex-direction: column; gap: 12px; overflow-y: auto; min-height: 0; }
+.right { display: grid; grid-template-rows: 1fr 1fr; gap: 12px; min-height: 0; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.card h2 { font-size: 14px; margin: 0 0 10px; }
+.card.grow { display: flex; flex-direction: column; min-height: 0; }
+label { display: block; font-size: 13px; margin: 6px 0; }
+input[type="text"], input[type="password"] {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  margin-top: 3px;
+}
+input[type="file"] { font-size: 12px; width: 100%; margin-top: 3px; }
+button {
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: #eef3f8; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.block { width: 100%; }
+button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+button.primary:hover:not(:disabled) { background: var(--blue-dark); }
+.status { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.radio, .check { display: flex; gap: 6px; align-items: center; font-size: 13px; }
+.radio input, .check input { margin: 0; }
+.seg { display: flex; margin: 6px 0 10px; }
+.seg-btn { flex: 1; border-radius: 0; }
+.seg-btn:first-child { border-radius: 6px 0 0 6px; }
+.seg-btn:last-child { border-radius: 0 6px 6px 0; border-left: none; }
+.seg-btn.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+.row { display: flex; gap: 8px; align-items: flex-end; }
+.row > *:first-child { flex: 1; }
+.row button { flex: none; margin-bottom: 0; }
+pre {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: #10161d;
+  color: #c9d6e2;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 10px;
+  border-radius: 6px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; overflow-y: auto; }
+  .right { grid-template-rows: 320px 320px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>{{ app_name }}</h1>
+  <span>v{{ version }}</span>
+</header>
+<div class="layout">
+  <div class="left">
+    <section class="card">
+      <h2>Navidrome 服务器设置</h2>
+      <label>服务器地址
+        <input type="text" id="url" placeholder="http://your-navidrome-server:4533">
+      </label>
+      <label>用户名
+        <input type="text" id="username" autocomplete="username">
+      </label>
+      <label>密码
+        <input type="password" id="password" autocomplete="current-password">
+      </label>
+      <button id="connect-btn" class="primary block">连接到 Navidrome</button>
+      <div id="server-status" class="status">状态: 未连接</div>
+    </section>
+
+    <section class="card">
+      <h2>Navidrome 媒体库数据</h2>
+      <button id="scan-btn" class="block" disabled>扫描 Navidrome 全库</button>
+      <div class="row" style="margin-top:8px;">
+        <input type="file" id="lib-file" accept=".json,application/json">
+        <button id="load-lib-btn">从文件加载数据</button>
+      </div>
+      <button id="export-lib-btn" class="block" style="margin-top:8px;" disabled>导出当前数据到文件</button>
+      <div id="lib-status" class="status">未加载媒体库数据</div>
+    </section>
+
+    <section class="card">
+      <h2>歌单输入源</h2>
+      <label class="radio">
+        <input type="radio" name="src" value="url_id" checked> 从 URL 或 ID 获取歌单
+      </label>
+      <input type="text" id="playlist-input" placeholder="输入歌单 URL 或 ID (QQ/网易云/Apple Music)">
+      <label class="radio" style="margin-top:10px;">
+        <input type="radio" name="src" value="file"> 从匹配结果文件上传歌单 (跳过匹配)
+      </label>
+      <input type="file" id="result-file" accept=".txt,text/plain" disabled>
+    </section>
+
+    <section class="card">
+      <h2>输出与服务器操作</h2>
+      <label>匹配模式</label>
+      <div class="seg">
+        <button class="seg-btn active" data-mode="模糊匹配">模糊匹配</button>
+        <button class="seg-btn" data-mode="完全匹配">完全匹配</button>
+      </div>
+      <label class="check">
+        <input type="checkbox" id="create-pl" checked> 在 Navidrome 上创建/更新同名歌单 (若存在则覆盖)
+      </label>
+      <label class="check">
+        <input type="checkbox" id="make-public"> 将创建的歌单设为公开
+      </label>
+    </section>
+
+    <button id="start-btn" class="primary block" disabled>开始匹配与创建</button>
+    <button id="download-result-btn" class="block" disabled>下载结果文件</button>
+  </div>
+
+  <div class="right">
+    <section class="card grow">
+      <h2>日志和状态</h2>
+      <pre id="log-area"></pre>
+    </section>
+    <section class="card grow">
+      <h2>未匹配歌曲</h2>
+      <pre id="unmatched-area"></pre>
+    </section>
+  </div>
+</div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const urlEl = $('url'), userEl = $('username'), passEl = $('password');
+  const connectBtn = $('connect-btn'), serverStatusEl = $('server-status');
+  const scanBtn = $('scan-btn'), libFileEl = $('lib-file'), loadLibBtn = $('load-lib-btn');
+  const exportLibBtn = $('export-lib-btn'), libStatusEl = $('lib-status');
+  const playlistInputEl = $('playlist-input'), resultFileEl = $('result-file');
+  const createPlEl = $('create-pl'), makePublicEl = $('make-public');
+  const startBtn = $('start-btn'), downloadBtn = $('download-result-btn');
+  const logArea = $('log-area'), unmatchedArea = $('unmatched-area');
+
+  const state = {
+    connected: false,
+    serverVersion: 'N/A',
+    libraryCount: 0,
+    jobRunning: false,
+    hasResult: false,
+    matchMode: '模糊匹配',
+  };
+
+  function currentSource() {
+    return document.querySelector('input[name="src"]:checked').value;
+  }
+
+  function updateUI() {
+    const running = state.jobRunning;
+    const src = currentSource();
+
+    connectBtn.disabled = running;
+    scanBtn.disabled = !(state.connected && !running && src === 'url_id');
+    libFileEl.disabled = running;
+    loadLibBtn.disabled = running;
+    exportLibBtn.disabled = !(state.libraryCount > 0 && !running);
+
+    playlistInputEl.disabled = src !== 'url_id';
+    resultFileEl.disabled = src === 'url_id';
+
+    let canStart = !running;
+    if (src === 'url_id') {
+      canStart = canStart && state.libraryCount > 0;
+    } else {
+      canStart = canStart && resultFileEl.files.length > 0;
+    }
+    if (createPlEl.checked) {
+      canStart = canStart && state.connected;
+    }
+    startBtn.disabled = !canStart;
+
+    createPlEl.disabled = running;
+    makePublicEl.disabled = running || !createPlEl.checked;
+    downloadBtn.disabled = !(state.hasResult && !running);
+
+    serverStatusEl.textContent = state.connected
+      ? `状态: 已连接到 Navidrome (v${state.serverVersion})`
+      : '状态: 未连接';
+    libStatusEl.textContent = state.libraryCount > 0
+      ? `已加载 ${state.libraryCount} 首歌曲`
+      : '未加载媒体库数据';
+  }
+
+  async function refreshStatus() {
+    try {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      state.connected = data.connected;
+      state.serverVersion = data.server_version;
+      state.libraryCount = data.library_count;
+      state.jobRunning = data.job_running;
+      state.hasResult = data.has_result;
+      updateUI();
+    } catch (e) { /* 服务暂时不可达时保持现状 */ }
+  }
+
+  async function postJSON(path, body) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    return res.json();
+  }
+
+  function showError(err) {
+    alert(typeof err === 'string' ? err : (err && err.error) || '操作失败');
+  }
+
+  // --- 事件绑定 ---
+  connectBtn.addEventListener('click', async () => {
+    const data = await postJSON('/api/connect', {
+      url: urlEl.value, username: userEl.value, password: passEl.value,
+    });
+    if (!data.ok) showError(data);
+    refreshStatus();
+  });
+
+  scanBtn.addEventListener('click', async () => {
+    const data = await postJSON('/api/scan');
+    if (!data.ok) showError(data);
+    refreshStatus();
+  });
+
+  loadLibBtn.addEventListener('click', async () => {
+    const f = libFileEl.files[0];
+    if (!f) { alert('请先选择要加载的 Navidrome 库数据文件。'); return; }
+    const fd = new FormData();
+    fd.append('file', f);
+    const res = await fetch('/api/library/load', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!data.ok) showError(data);
+    else alert(`加载完成\n\n成功加载 ${data.count} 条歌曲信息。`);
+    refreshStatus();
+  });
+
+  exportLibBtn.addEventListener('click', () => {
+    window.location = '/api/library/export';
+  });
+
+  document.querySelectorAll('input[name="src"]').forEach((r) =>
+    r.addEventListener('change', updateUI));
+
+  document.querySelectorAll('.seg-btn').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.seg-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.matchMode = btn.dataset.mode;
+    }));
+
+  createPlEl.addEventListener('change', updateUI);
+  resultFileEl.addEventListener('change', updateUI);
+
+  startBtn.addEventListener('click', async () => {
+    if (createPlEl.checked) {
+      let text = '您已选择在 Navidrome 上创建/更新歌单。\n如果服务器上存在同名歌单，它将被删除并替换。\n';
+      if (makePublicEl.checked) text += '\n同时，新歌单将被尝试设为公开。\n';
+      text += '\n确定要继续吗？';
+      if (!confirm(text)) return;
+    }
+
+    logArea.textContent = '';
+    unmatchedArea.textContent = '';
+
+    const fd = new FormData();
+    fd.append('input_type', currentSource());
+    fd.append('match_mode', state.matchMode);
+    fd.append('create_on_server', String(createPlEl.checked));
+    fd.append('make_public', String(makePublicEl.checked));
+    if (currentSource() === 'url_id') {
+      fd.append('playlist_input', playlistInputEl.value.trim());
+    } else {
+      const f = resultFileEl.files[0];
+      if (f) fd.append('result_file', f);
+    }
+    const res = await fetch('/api/match', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!data.ok) showError(data);
+    refreshStatus();
+  });
+
+  downloadBtn.addEventListener('click', () => {
+    window.location = '/api/result/download';
+  });
+
+  // --- 日志区域 ---
+  function appendLine(area, msg) {
+    area.textContent += msg + '\n';
+    // 防止长时间运行导致 DOM 过大，仅保留末尾约 3000 行
+    const lines = area.textContent.split('\n');
+    if (lines.length > 4000) {
+      area.textContent = lines.slice(-3000).join('\n');
+    }
+    area.scrollTop = area.scrollHeight;
+  }
+
+  // --- SSE ---
+  const es = new EventSource('/api/events');
+  es.addEventListener('log', (e) => appendLine(logArea, JSON.parse(e.data).message));
+  es.addEventListener('unmatched', (e) => appendLine(unmatchedArea, JSON.parse(e.data).message));
+  es.addEventListener('alert', (e) => {
+    const a = JSON.parse(e.data);
+    alert(`${a.title}\n\n${a.message}`);
+  });
+  es.addEventListener('done', () => { refreshStatus(); });
+
+  refreshStatus();
+  setInterval(refreshStatus, 5000);
+})();
+</script>
+</body>
+</html>
