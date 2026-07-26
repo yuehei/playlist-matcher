@@ -30,7 +30,7 @@ from fuzzywuzzy import fuzz
 # --- 全局配置和常量 ---
 APP_NAME = "歌单匹配与创建器 (Navidrome)"
 LOG_FILE_BASENAME = "playlist_match_create_debug_navidrome"
-APP_VERSION = "2.0.0"  # Web 版本 (Flask + SSE)，替代原 CustomTkinter GUI
+APP_VERSION = "2.2.0"  # Web 版本 (Flask + SSE)：新增浏览器记忆(localStorage) + 批量歌单 + 多 profile
 NAVIDROME_CLIENT_NAME = "PlaylistMatcherGUI_CTk"
 NAVIDROME_API_VERSION = "1.16.1" # Subsonic API Version
 
@@ -125,6 +125,52 @@ def get_temp_file_logger(process_name):
 def _notify_completion():
     """匹配流程结束时通知前端弹出完成提示（哨兵由 finally 统一发送）。"""
     gui_alert_queue.put(("info", "完成", "歌单匹配与创建过程已完成！"))
+
+def _safe_filename(name, max_len=40):
+    """把任意字符串清理成可安全用于文件名的形式（保留中文/字母数字/下划线/连字符）。"""
+    if not name:
+        return "playlist"
+    cleaned = re.sub(r'[^\w\u4e00-\u9fff\-]', '_', str(name)).strip('._')
+    cleaned = re.sub(r'_+', '_', cleaned)
+    return (cleaned or "playlist")[:max_len]
+
+def _build_library_index(navidrome_library_data, file_logger):
+    """为 Navidrome 媒体库建立 _get_title_lookup_key → [track] 的索引（批量模式只建一次）。"""
+    log_message('info', "正在为 Navidrome 媒体库建立快速查找索引...", file_logger, to_gui=True)
+    navidrome_library_index = {}
+    for navidrome_track in navidrome_library_data:
+        lookup_key = _get_title_lookup_key(navidrome_track.get('title'))
+        if lookup_key:
+            if lookup_key not in navidrome_library_index:
+                navidrome_library_index[lookup_key] = []
+            navidrome_library_index[lookup_key].append(navidrome_track)
+    log_message('info', f"索引建立完成，共包含 {len(navidrome_library_index)} 个唯一查找键。", file_logger, to_gui=True)
+    return navidrome_library_index
+
+def _setup_run_logger():
+    """为一次匹配流程创建独立的文件 logger（DEBUG 级别）。
+    返回 (file_logger, file_handler, log_filename)。失败时 file_handler 为 None。"""
+    log_filename = f"{LOG_FILE_BASENAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    file_logger_name = f'PlaylistMatchFileLogger_Navidrome_{get_random_string()}'
+    file_logger = logging.getLogger(file_logger_name)
+    file_logger.propagate = False
+    file_logger.setLevel(logging.DEBUG)
+    if file_logger.hasHandlers():
+        for handler in file_logger.handlers[:]:
+            handler.close()
+            file_logger.removeHandler(handler)
+    log_dir = os.path.dirname(log_filename)
+    if log_dir and not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir)
+        except OSError as e:
+            print(f"Error creating log directory {log_dir}: {e}")
+            log_queue.put(f"[ERROR] 创建日志目录失败: {log_dir}")
+            return file_logger, None, log_filename
+    file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    file_logger.addHandler(file_handler)
+    return file_logger, file_handler, log_filename
 
 # --- Navidrome API 调用 ---
 def _get_auth_params(username, password):
@@ -839,96 +885,46 @@ def _parse_result_file_for_upload(filepath, file_logger):
         return None, [], []
 
 # --- 核心匹配与服务器操作逻辑（后台工作线程入口）---
-def run_matching_process(navidrome_config, playlist_input_type, playlist_input_data, output_filepath,
-                         create_playlist_on_server, make_playlist_public, match_mode,
-                         navidrome_library_data):
-    log_filename = f"{LOG_FILE_BASENAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    file_logger_name = f'PlaylistMatchFileLogger_Navidrome_{get_random_string()}'
-    file_logger = logging.getLogger(file_logger_name)
-    file_logger.propagate = False
-    file_logger.setLevel(logging.DEBUG) # Set to debug for detailed matching logs
-    if file_logger.hasHandlers():
-        for handler in file_logger.handlers[:]:
-            handler.close()
-            file_logger.removeHandler(handler)
-    log_dir = os.path.dirname(log_filename)
-    if log_dir and not os.path.exists(log_dir):
-        try: os.makedirs(log_dir)
-        except OSError as e:
-            print(f"Error creating log directory {log_dir}: {e}")
-            log_queue.put(f"[ERROR] 创建日志目录失败: {log_dir}")
-            _notify_completion()
-            log_queue.put(PROCESS_COMPLETE_SENTINEL)
-            return
-    file_handler = None
+
+def _process_single_playlist(candidate, navidrome_library_index, navidrome_config,
+                              create_playlist_on_server, make_playlist_public, match_mode,
+                              output_filepath, file_logger, playlist_input_type="url_id"):
+    """处理单个歌单：fetch → match → server ops → 写结果文件。
+    - candidate: (platform, id_or_url) 元组。
+    - navidrome_library_index: 已建好的索引（批量模式只建一次）；file 模式可为 None。
+    - 不调用 _notify_completion（由调用方决定何时通知）。
+    - 异常被捕获并记录，**不抛出**，让批量循环继续；返回状态 dict。
+    - playlist_input_type 为 "file" 时跳过 fetch/match（复用结果文件），candidate 参数被忽略。
+    返回 dict: {'ok': bool, 'matched': int, 'unmatched': int, 'total': int, 'name': str}。
+    """
+    result = {'ok': False, 'matched': 0, 'unmatched': 0, 'total': 0, 'name': None}
+
+    source_playlist_name = None
+    source_song_list = []
+    playlist_type_for_summary = "未知类型"
+    playlist_id_for_summary = "未知"
+    matched_tracks = []
+    unmatched_source_songs_dict = {}
+    total_songs = 0
+
     try:
-        file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
-        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(file_formatter)
-        file_logger.addHandler(file_handler)
-        log_message('info', "="*30, file_logger, to_gui=True)
-        log_message('info', f"歌单匹配与创建器 (Navidrome) - 版本 {APP_VERSION}", file_logger, to_gui=True)
-        log_message('info', f"服务器操作选项: {'启用' if create_playlist_on_server else '禁用'}", file_logger, to_gui=True)
-        if create_playlist_on_server:
-            log_message('info', f"  - 创建为公开歌单: {'是' if make_playlist_public else '否'}", file_logger, to_gui=True)
-        log_message('info', f"匹配模式: {match_mode}", file_logger, to_gui=True)
-        log_message('info', "="*30, file_logger, to_gui=True)
-
-        source_playlist_name = None
-        source_song_list = []
-        playlist_type_for_summary = "未知类型"
-        playlist_id_for_summary = "未知"
-        total_songs = 0
-        matched_tracks = []
-        unmatched_source_songs_dict = {}
-
         if playlist_input_type == "file":
-            log_message('info', f"从文件 '{playlist_input_data}' 加载歌单信息...", file_logger, to_gui=True)
-            try:
-                parsed_name, parsed_matched_ids, parsed_unmatched_songs = _parse_result_file_for_upload(playlist_input_data, file_logger)
-                if not parsed_name or not parsed_matched_ids:
-                    log_message('error', f"从结果文件加载歌单信息失败或文件内容无效。", file_logger, to_gui=True)
-                    _notify_completion()
-                    return
-
-                source_playlist_name = parsed_name
-                matched_tracks = [{'id': song_id, 'title': f"ID: {song_id}", 'artist': '（来自文件）', 'path': ''} for song_id in parsed_matched_ids]
-                unmatched_source_songs_dict = {s['source_id']: s for s in parsed_unmatched_songs}
-                total_songs = len(parsed_matched_ids) + len(parsed_unmatched_songs)
-                playlist_type_for_summary = "来自匹配结果文件"
-                playlist_id_for_summary = os.path.basename(playlist_input_data)
-                log_message('info', f"已加载歌单 '{source_playlist_name}'，包含 {len(parsed_matched_ids)} 首匹配歌曲和 {len(parsed_unmatched_songs)} 首未匹配歌曲。", file_logger, to_gui=True)
-
-            except Exception as e:
-                log_message('error', f"处理结果文件时发生错误: {e}", file_logger, to_gui=True)
-                _notify_completion()
-                return
-
+            # file 模式：candidate 是文件路径
+            filepath = candidate if isinstance(candidate, str) else (candidate[1] if len(candidate) > 1 else "")
+            log_message('info', f"从文件 '{filepath}' 加载歌单信息...", file_logger, to_gui=True)
+            parsed_name, parsed_matched_ids, parsed_unmatched_songs = _parse_result_file_for_upload(filepath, file_logger)
+            if not parsed_name or not parsed_matched_ids:
+                log_message('error', f"从结果文件加载歌单信息失败或文件内容无效。", file_logger, to_gui=True)
+                return result
+            source_playlist_name = parsed_name
+            matched_tracks = [{'id': song_id, 'title': f"ID: {song_id}", 'artist': '（来自文件）', 'path': ''} for song_id in parsed_matched_ids]
+            unmatched_source_songs_dict = {s['source_id']: s for s in parsed_unmatched_songs}
+            total_songs = len(parsed_matched_ids) + len(parsed_unmatched_songs)
+            playlist_type_for_summary = "来自匹配结果文件"
+            playlist_id_for_summary = os.path.basename(filepath)
+            log_message('info', f"已加载歌单 '{source_playlist_name}'，包含 {len(parsed_matched_ids)} 首匹配歌曲和 {len(parsed_unmatched_songs)} 首未匹配歌曲。", file_logger, to_gui=True)
         else:
-            if not navidrome_library_data:
-                log_message('error', "Navidrome 媒体库数据未加载，无法进行匹配。请先扫描或加载。", file_logger, to_gui=True)
-                _notify_completion()
-                return
-
-            # --- 性能优化：建立索引 ---
-            log_message('info', "正在为 Navidrome 媒体库建立快速查找索引...", file_logger, to_gui=True)
-            navidrome_library_index = {}
-            for navidrome_track in navidrome_library_data:
-                lookup_key = _get_title_lookup_key(navidrome_track.get('title'))
-                if lookup_key:
-                    if lookup_key not in navidrome_library_index:
-                        navidrome_library_index[lookup_key] = []
-                    navidrome_library_index[lookup_key].append(navidrome_track)
-            log_message('info', f"索引建立完成，共包含 {len(navidrome_library_index)} 个唯一查找键。", file_logger, to_gui=True)
-
-            # --- 获取源歌单 ---
-            playlist_candidates = parse_playlist_input(playlist_input_data, file_logger)
-            if not playlist_candidates:
-                log_message('error', "无效的歌单输入，处理中止。", file_logger, to_gui=True)
-                _notify_completion()
-                return
-
-            candidate_type, candidate_data = playlist_candidates[0]
+            candidate_type, candidate_data = candidate
             original_input_for_summary = candidate_data
 
             if candidate_type == "qq":
@@ -954,16 +950,16 @@ def run_matching_process(navidrome_config, playlist_input_type, playlist_input_d
                 playlist_type_for_summary = "Apple Music"
                 playlist_id_for_summary = original_input_for_summary
                 if isinstance(original_input_for_summary, str) and ('/' in original_input_for_summary and 'pl.' in original_input_for_summary):
-                     id_match_display = re.search(r"(pl\.[a-zA-Z0-9\-_]+)", original_input_for_summary)
-                     if id_match_display: playlist_id_for_summary = id_match_display.group(1)
+                    id_match_display = re.search(r"(pl\.[a-zA-Z0-9\-_]+)", original_input_for_summary)
+                    if id_match_display: playlist_id_for_summary = id_match_display.group(1)
 
             if not source_playlist_name:
-                 source_playlist_name = f"导入的歌单_{get_random_string(4)}"
-                 log_message('warning', f"未能从源平台获取歌单名称，将使用默认名称: {source_playlist_name}", file_logger, to_gui=True)
+                source_playlist_name = f"导入的歌单_{get_random_string(4)}"
+                log_message('warning', f"未能从源平台获取歌单名称，将使用默认名称: {source_playlist_name}", file_logger, to_gui=True)
             if not source_song_list:
-                log_message('info', f"\n无法处理歌单 '{source_playlist_name or playlist_input_data}' 或歌单为空，处理中止。", file_logger, to_gui=True)
-                _notify_completion()
-                return
+                log_message('info', f"\n无法处理歌单 '{source_playlist_name or candidate_data}' 或歌单为空，跳过。", file_logger, to_gui=True)
+                result['name'] = source_playlist_name
+                return result
 
             source_song_list_valid = [s for s in source_song_list if s and s.get('title')]
             total_songs = len(source_song_list_valid)
@@ -974,26 +970,19 @@ def run_matching_process(navidrome_config, playlist_input_type, playlist_input_d
             unmatched_source_songs_dict = {s['source_id']: s for s in source_song_list_valid}
             for idx, source_track in enumerate(source_song_list_valid):
                 log_message('info', f"\n匹配中 ({idx+1}/{total_songs}): {source_track['platform']} 歌曲 '{source_track['title']}' by '{source_track['artist']}'", file_logger, to_gui=True)
-
-                # --- 性能优化：使用索引查找候选者 ---
                 lookup_key = _get_title_lookup_key(source_track.get('title'))
-                candidate_tracks = navidrome_library_index.get(lookup_key, [])
-
+                candidate_tracks = navidrome_library_index.get(lookup_key, []) if navidrome_library_index else []
                 if not candidate_tracks:
                     log_message('info', f"  => 未在 Navidrome 索引中找到标题为 '{lookup_key}' 的候选歌曲。", file_logger, to_gui=False)
                     continue
-
                 log_message('info', f"  => 在索引中找到 {len(candidate_tracks)} 首候选歌曲，开始精确比较...", file_logger, to_gui=False)
-
                 best_match_navidrome, match_score = find_best_match_in_candidates(source_track, candidate_tracks, file_logger, match_mode)
-
                 if best_match_navidrome:
                     matched_tracks.append(best_match_navidrome)
                     if source_track['source_id'] in unmatched_source_songs_dict:
                         del unmatched_source_songs_dict[source_track['source_id']]
                 else:
                     log_message('info', f"  => 在 {len(candidate_tracks)} 个候选中未找到足够好的匹配 (最高分: {match_score})", file_logger, to_gui=False)
-
                 log_message('info', "-"*30, file_logger, to_gui=False)
 
         # --- 服务器操作和总结报告 ---
@@ -1035,8 +1024,8 @@ def run_matching_process(navidrome_config, playlist_input_type, playlist_input_d
                 else:
                     server_op_status = "失败 (无法创建新歌单)"
             except Exception as e:
-                 log_message('error', f"执行服务器歌单操作时出错: {e}", file_logger, to_gui=True)
-                 server_op_status = f"失败 ({e})"
+                log_message('error', f"执行服务器歌单操作时出错: {e}", file_logger, to_gui=True)
+                server_op_status = f"失败 ({e})"
             log_message('info', "服务器歌单操作结束。", file_logger, to_gui=True)
 
         log_message('info', "\n" + "="*30, file_logger, to_gui=True)
@@ -1074,20 +1063,20 @@ def run_matching_process(navidrome_config, playlist_input_type, playlist_input_d
         if matched_tracks:
             matched_list_str += f"\n成功匹配的 Navidrome 歌曲列表 (共 {matched_count} 条映射关系):\n"
             for i, track_match in enumerate(matched_tracks):
-                 source_info = track_match.get('_source_track_info', {})
-                 lib_title = track_match.get('title', '未知标题')
-                 lib_artist_str = track_match.get('artist', "未知歌手")
-                 lib_id = track_match.get('id', '未知ID')
-                 lib_path = track_match.get('path', '未知路径')
-                 source_platform = source_info.get('platform', '?')
-                 source_title = source_info.get('title', '未知标题')
-                 source_artist = source_info.get('artist', '未知歌手')
-                 source_id = source_info.get('source_id', '未知ID')
-                 if playlist_input_type == "file":
-                     matched_list_str += (f"  {i+1}. Navidrome: '{lib_title}' by '{lib_artist_str}' (ID: {lib_id}, Path: {lib_path})\n")
-                 else:
-                     matched_list_str += (f"  {i+1}. Navidrome: '{lib_title}' by '{lib_artist_str}' (ID: {lib_id}, Path: {lib_path}) "
-                                     f"<-- {source_platform}: '{source_title}' by '{source_artist}' (ID: {source_id})\n")
+                source_info = track_match.get('_source_track_info', {})
+                lib_title = track_match.get('title', '未知标题')
+                lib_artist_str = track_match.get('artist', "未知歌手")
+                lib_id = track_match.get('id', '未知ID')
+                lib_path = track_match.get('path', '未知路径')
+                source_platform = source_info.get('platform', '?')
+                source_title = source_info.get('title', '未知标题')
+                source_artist = source_info.get('artist', '未知歌手')
+                source_id = source_info.get('source_id', '未知ID')
+                if playlist_input_type == "file":
+                    matched_list_str += (f"  {i+1}. Navidrome: '{lib_title}' by '{lib_artist_str}' (ID: {lib_id}, Path: {lib_path})\n")
+                else:
+                    matched_list_str += (f"  {i+1}. Navidrome: '{lib_title}' by '{lib_artist_str}' (ID: {lib_id}, Path: {lib_path}) "
+                                    f"<-- {source_platform}: '{source_title}' by '{source_artist}' (ID: {source_id})\n")
         try:
             output_dir = os.path.dirname(output_filepath)
             if output_dir and not os.path.exists(output_dir): os.makedirs(output_dir)
@@ -1098,6 +1087,58 @@ def run_matching_process(navidrome_config, playlist_input_type, playlist_input_d
             log_message('info', f"匹配结果已保存到: {output_filepath}", file_logger, to_gui=True)
         except Exception as e:
             log_message('error', f"保存结果文件失败: {e}", file_logger, to_gui=True)
+
+        result.update({'ok': True, 'matched': matched_count, 'unmatched': unmatched_count, 'total': total_songs, 'name': source_playlist_name})
+        return result
+
+    except Exception as e:
+        log_message('error', f"处理歌单 '{source_playlist_name or candidate}' 时发生未处理的错误: {e}", file_logger, to_gui=True)
+        if file_logger: file_logger.exception("Unhandled exception in _process_single_playlist:")
+        result['name'] = source_playlist_name
+        return result
+
+
+def run_matching_process(navidrome_config, playlist_input_type, playlist_input_data, output_filepath,
+                         create_playlist_on_server, make_playlist_public, match_mode,
+                         navidrome_library_data):
+    """单歌单匹配流程（后台工作线程入口）。file 模式或单行 url_id 模式走此路径。
+    多行 url_id 输入请改走 run_batch_matching_process。"""
+    file_logger, file_handler, log_filename = _setup_run_logger()
+    if file_handler is None:
+        _notify_completion()
+        log_queue.put(PROCESS_COMPLETE_SENTINEL)
+        return
+    try:
+        log_message('info', "="*30, file_logger, to_gui=True)
+        log_message('info', f"歌单匹配与创建器 (Navidrome) - 版本 {APP_VERSION}", file_logger, to_gui=True)
+        log_message('info', f"服务器操作选项: {'启用' if create_playlist_on_server else '禁用'}", file_logger, to_gui=True)
+        if create_playlist_on_server:
+            log_message('info', f"  - 创建为公开歌单: {'是' if make_playlist_public else '否'}", file_logger, to_gui=True)
+        log_message('info', f"匹配模式: {match_mode}", file_logger, to_gui=True)
+        log_message('info', "="*30, file_logger, to_gui=True)
+
+        if playlist_input_type == "file":
+            result = _process_single_playlist(
+                playlist_input_data, None, navidrome_config,
+                create_playlist_on_server, make_playlist_public, match_mode,
+                output_filepath, file_logger, playlist_input_type="file")
+        else:
+            if not navidrome_library_data:
+                log_message('error', "Navidrome 媒体库数据未加载，无法进行匹配。请先扫描或加载。", file_logger, to_gui=True)
+                _notify_completion()
+                return
+            navidrome_library_index = _build_library_index(navidrome_library_data, file_logger)
+            playlist_candidates = parse_playlist_input(playlist_input_data, file_logger)
+            if not playlist_candidates:
+                log_message('error', "无效的歌单输入，处理中止。", file_logger, to_gui=True)
+                _notify_completion()
+                return
+            # 单歌单路径：取第一个候选（保持与 v2.0.x 行为一致）
+            result = _process_single_playlist(
+                playlist_candidates[0], navidrome_library_index, navidrome_config,
+                create_playlist_on_server, make_playlist_public, match_mode,
+                output_filepath, file_logger, playlist_input_type="url_id")
+
         log_message('info', "\n处理完成。详细日志已写入 " + log_filename, file_logger, to_gui=True)
         _notify_completion()
     except Exception as e:
@@ -1107,8 +1148,104 @@ def run_matching_process(navidrome_config, playlist_input_type, playlist_input_d
     finally:
         log_queue.put(PROCESS_COMPLETE_SENTINEL)
         if file_logger and file_handler:
-             try:
-                 file_logger.removeHandler(file_handler)
-                 file_handler.close()
-             except Exception as e_close_log:
-                 print(f"Error closing main process file logger: {e_close_log}")
+            try:
+                file_logger.removeHandler(file_handler)
+                file_handler.close()
+            except Exception as e_close_log:
+                print(f"Error closing main process file logger: {e_close_log}")
+
+
+def run_batch_matching_process(navidrome_config, playlist_input_type, playlist_input_data, output_filepath,
+                               create_playlist_on_server, make_playlist_public, match_mode,
+                               navidrome_library_data):
+    """批量歌单匹配流程（后台工作线程入口）。签名与 run_matching_process 一致。
+    仅处理 url_id 模式：将 playlist_input_data 按行拆分，每行一个歌单。
+    建一次索引，循环处理每个歌单，各自独立创建同名 Navidrome 歌单、各自写独立结果文件。
+    每个歌单的结果文件命名：{output_filepath 无扩展名}_{序号}.txt。
+    output_filepath 作为"基础名"，实际每个歌单的文件在其基础上加序号后缀。"""
+    file_logger, file_handler, log_filename = _setup_run_logger()
+    if file_handler is None:
+        _notify_completion()
+        log_queue.put(PROCESS_COMPLETE_SENTINEL)
+        return
+    try:
+        log_message('info', "="*30, file_logger, to_gui=True)
+        log_message('info', f"歌单匹配与创建器 (Navidrome) - 版本 {APP_VERSION} (批量模式)", file_logger, to_gui=True)
+        log_message('info', f"服务器操作选项: {'启用' if create_playlist_on_server else '禁用'}", file_logger, to_gui=True)
+        if create_playlist_on_server:
+            log_message('info', f"  - 创建为公开歌单: {'是' if make_playlist_public else '否'}", file_logger, to_gui=True)
+        log_message('info', f"匹配模式: {match_mode}", file_logger, to_gui=True)
+        log_message('info', "="*30, file_logger, to_gui=True)
+
+        # --- 拆行 + 解析候选 ---
+        candidates = []
+        for line_num, raw_line in enumerate(str(playlist_input_data).split('\n'), 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parsed = parse_playlist_input(line, file_logger)
+            if not parsed:
+                log_message('warning', f"第 {line_num} 行无法识别，已跳过: {raw_line}", file_logger, to_gui=True)
+                continue
+            # parse_playlist_input 每行只返回一个候选，取第一个
+            candidates.append(parsed[0])
+
+        if not candidates:
+            log_message('error', "未识别到任何有效的歌单输入，批量处理中止。", file_logger, to_gui=True)
+            _notify_completion()
+            return
+
+        if not navidrome_library_data:
+            log_message('error', "Navidrome 媒体库数据未加载，无法进行匹配。请先扫描或加载。", file_logger, to_gui=True)
+            _notify_completion()
+            return
+
+        # --- 建一次索引（批量模式的核心优化）---
+        navidrome_library_index = _build_library_index(navidrome_library_data, file_logger)
+
+        n = len(candidates)
+        log_message('info', f"\n===== 批量处理 {n} 个歌单 =====", file_logger, to_gui=True)
+
+        # output_filepath 作为基础名，去掉扩展名后加序号
+        base, _ = os.path.splitext(output_filepath)
+
+        total_matched = 0
+        total_unmatched = 0
+        total_songs_all = 0
+        last_output = None
+
+        for i, candidate in enumerate(candidates):
+            cand_type, cand_data = candidate
+            log_message('info', f"\n===== 歌单 {i+1}/{n}: {cand_type} -> {cand_data} =====", file_logger, to_gui=True)
+            per_playlist_output = f"{base}_{i+1}.txt"
+            last_output = per_playlist_output
+            result = _process_single_playlist(
+                candidate, navidrome_library_index, navidrome_config,
+                create_playlist_on_server, make_playlist_public, match_mode,
+                per_playlist_output, file_logger, playlist_input_type="url_id")
+            if result.get('ok'):
+                total_matched += result.get('matched', 0)
+                total_unmatched += result.get('unmatched', 0)
+                total_songs_all += result.get('total', 0)
+            else:
+                log_message('warning', f"歌单 {i+1}/{n} 处理未成功完成，继续下一个。", file_logger, to_gui=True)
+
+        log_message('info', f"\n===== 批量完成：{n} 个歌单 =====", file_logger, to_gui=True)
+        log_message('info', f"总计：源歌曲 {total_songs_all} 首，成功匹配 {total_matched} 首，未匹配 {total_unmatched} 首。", file_logger, to_gui=True)
+        # 把最后一个结果文件作为可下载文件（保持下载按钮语义）
+        if last_output:
+            log_queue.put(f"[INFO] 批量结果文件列表：{base}_1.txt ~ {base}_{n}.txt（下载按钮提供最后一个）")
+        log_message('info', "\n处理完成。详细日志已写入 " + log_filename, file_logger, to_gui=True)
+        _notify_completion()
+    except Exception as e:
+        log_message('error', f"批量匹配过程中发生未处理的错误: {e}", file_logger, to_gui=True)
+        if file_logger: file_logger.exception("Unhandled exception during batch matching:")
+        _notify_completion()
+    finally:
+        log_queue.put(PROCESS_COMPLETE_SENTINEL)
+        if file_logger and file_handler:
+            try:
+                file_logger.removeHandler(file_handler)
+                file_handler.close()
+            except Exception as e_close_log:
+                print(f"Error closing batch process file logger: {e_close_log}")

@@ -62,6 +62,17 @@ input[type="text"], input[type="password"] {
   font-size: 13px;
   margin-top: 3px;
 }
+textarea {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  margin-top: 3px;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 60px;
+}
 input[type="file"] { font-size: 12px; width: 100%; margin-top: 3px; }
 button {
   padding: 7px 12px;
@@ -87,6 +98,9 @@ button.primary:hover:not(:disabled) { background: var(--blue-dark); }
 .row { display: flex; gap: 8px; align-items: flex-end; }
 .row > *:first-child { flex: 1; }
 .row button { flex: none; margin-bottom: 0; }
+.profile-row { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
+.profile-row select { flex: 1; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; background: #fff; }
+.profile-row button { padding: 6px 8px; font-size: 12px; flex: none; }
 pre {
   flex: 1;
   min-height: 0;
@@ -115,6 +129,12 @@ pre {
   <div class="left">
     <section class="card">
       <h2>Navidrome 服务器设置</h2>
+      <div class="profile-row">
+        <select id="profile-select" title="切换配置档案"></select>
+        <button id="profile-new" title="新建配置档案">新建</button>
+        <button id="profile-rename" title="重命名当前配置档案">重命名</button>
+        <button id="profile-delete" title="删除当前配置档案">删除</button>
+      </div>
       <label>服务器地址
         <input type="text" id="url" placeholder="http://your-navidrome-server:4533">
       </label>
@@ -144,7 +164,7 @@ pre {
       <label class="radio">
         <input type="radio" name="src" value="url_id" checked> 从 URL 或 ID 获取歌单
       </label>
-      <input type="text" id="playlist-input" placeholder="输入歌单 URL 或 ID (QQ/网易云/Apple Music)">
+      <textarea id="playlist-input" rows="3" placeholder="每行输入一个歌单 URL 或 ID (QQ/网易云/Apple Music)&#10;支持批量，每行一个"></textarea>
       <label class="radio" style="margin-top:10px;">
         <input type="radio" name="src" value="file"> 从匹配结果文件上传歌单 (跳过匹配)
       </label>
@@ -193,6 +213,8 @@ pre {
   const createPlEl = $('create-pl'), makePublicEl = $('make-public');
   const startBtn = $('start-btn'), downloadBtn = $('download-result-btn');
   const logArea = $('log-area'), unmatchedArea = $('unmatched-area');
+  const profileSelectEl = $('profile-select'), profileNewBtn = $('profile-new');
+  const profileRenameBtn = $('profile-rename'), profileDeleteBtn = $('profile-delete');
 
   const state = {
     connected: false,
@@ -202,6 +224,118 @@ pre {
     hasResult: false,
     matchMode: '模糊匹配',
   };
+
+  // --- 浏览器记忆（localStorage，多 profile）---
+  // 注意：密码以明文存储。本机单人 127.0.0.1 场景下的可接受折中。
+  // 存储 schema: {schema_version:2, profiles:{name:{navidrome_url,...}}, active_profile:name}
+  // 兼容 schema_version:1（单份设置）→ 迁移为 profiles={"default":<旧对象>}
+  const STORAGE_KEY = 'playlistMatcher.settings';
+  const DEFAULT_PROFILE = 'default';
+
+  function readStore() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      const s = JSON.parse(raw);
+      if (!s) return null;
+      // 迁移 v1 → v2
+      if (s.schema_version === 1) {
+        return {
+          schema_version: 2,
+          profiles: { [DEFAULT_PROFILE]: s },
+          active_profile: DEFAULT_PROFILE,
+        };
+      }
+      if (s.schema_version !== 2) return null;
+      return s;
+    } catch (e) { return null; }
+  }
+
+  function writeStore(store) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); }
+    catch (e) { /* localStorage 不可用时静默降级 */ }
+  }
+
+  // 从当前表单读取一个 profile 对象
+  function formToProfile() {
+    return {
+      navidrome_url: urlEl.value,
+      navidrome_username: userEl.value,
+      navidrome_password: passEl.value,
+      match_mode: state.matchMode,
+      create_on_server: createPlEl.checked,
+      make_public: makePublicEl.checked,
+    };
+  }
+
+  // 把一个 profile 对象回填到表单
+  function profileToForm(p) {
+    if (!p) p = {};
+    if (typeof p.navidrome_url === 'string') urlEl.value = p.navidrome_url;
+    else urlEl.value = '';
+    if (typeof p.navidrome_username === 'string') userEl.value = p.navidrome_username;
+    else userEl.value = '';
+    if (typeof p.navidrome_password === 'string') passEl.value = p.navidrome_password;
+    else passEl.value = '';
+    const mm = (p.match_mode === '完全匹配') ? '完全匹配' : '模糊匹配';
+    state.matchMode = mm;
+    document.querySelectorAll('.seg-btn').forEach((b) => {
+      b.classList.toggle('active', b.dataset.mode === mm);
+    });
+    createPlEl.checked = !!p.create_on_server;
+    makePublicEl.checked = !!p.make_public;
+    updateUI();
+  }
+
+  function refreshProfileSelect() {
+    const store = readStore();
+    const names = store ? Object.keys(store.profiles) : [];
+    profileSelectEl.innerHTML = '';
+    names.forEach((n) => {
+      const opt = document.createElement('option');
+      opt.value = n; opt.textContent = n;
+      profileSelectEl.appendChild(opt);
+    });
+    if (store && store.active_profile && names.includes(store.active_profile)) {
+      profileSelectEl.value = store.active_profile;
+    }
+    // 至少保留一个 profile：只有一个时禁用删除
+    profileDeleteBtn.disabled = names.length <= 1;
+  }
+
+  // 保存当前表单到 active profile
+  function saveSettings() {
+    const store = readStore() || { schema_version: 2, profiles: {}, active_profile: DEFAULT_PROFILE };
+    if (!store.profiles[store.active_profile]) {
+      store.profiles[store.active_profile] = {};
+    }
+    store.profiles[store.active_profile] = formToProfile();
+    writeStore(store);
+  }
+
+  // 切换到指定 profile（仅回填表单，不自动连接）
+  function switchProfile(name) {
+    const store = readStore();
+    if (!store || !store.profiles[name]) return;
+    store.active_profile = name;
+    writeStore(store);
+    profileToForm(store.profiles[name]);
+    refreshProfileSelect();
+  }
+
+  // 页面加载时初始化 profile：若无存储则创建 default
+  function loadSettings() {
+    let store = readStore();
+    if (!store || !store.profiles || Object.keys(store.profiles).length === 0) {
+      store = { schema_version: 2, profiles: { [DEFAULT_PROFILE]: {} }, active_profile: DEFAULT_PROFILE };
+      writeStore(store);
+    }
+    refreshProfileSelect();
+    const active = store.active_profile && store.profiles[store.active_profile]
+      ? store.active_profile
+      : Object.keys(store.profiles)[0];
+    profileToForm(store.profiles[active] || {});
+  }
 
   function currentSource() {
     return document.querySelector('input[name="src"]:checked').value;
@@ -216,13 +350,21 @@ pre {
     libFileEl.disabled = running;
     loadLibBtn.disabled = running;
     exportLibBtn.disabled = !(state.libraryCount > 0 && !running);
+    // 任务运行时锁定 profile 切换，避免中途换配置
+    profileSelectEl.disabled = running;
+    profileNewBtn.disabled = running;
+    profileRenameBtn.disabled = running;
+    // 删除按钮：运行时禁用；只有一个 profile 时也禁用（由 refreshProfileSelect 维护）
+    profileDeleteBtn.disabled = running || profileDeleteBtn.disabled;
 
     playlistInputEl.disabled = src !== 'url_id';
     resultFileEl.disabled = src === 'url_id';
 
     let canStart = !running;
     if (src === 'url_id') {
-      canStart = canStart && state.libraryCount > 0;
+      // 多行 textarea：至少有一行非空输入
+      const hasInput = playlistInputEl.value.split('\n').some((l) => l.trim());
+      canStart = canStart && state.libraryCount > 0 && hasInput;
     } else {
       canStart = canStart && resultFileEl.files.length > 0;
     }
@@ -270,7 +412,52 @@ pre {
   }
 
   // --- 事件绑定 ---
+  // Profile 切换/新建/重命名/删除
+  profileSelectEl.addEventListener('change', () => {
+    saveSettings();  // 切换前先把当前表单存回旧 profile
+    switchProfile(profileSelectEl.value);
+  });
+  profileNewBtn.addEventListener('click', () => {
+    const name = prompt('请输入新配置档案名称：');
+    if (!name || !name.trim()) return;
+    const trimmed = name.trim();
+    const store = readStore() || { schema_version: 2, profiles: {}, active_profile: DEFAULT_PROFILE };
+    if (store.profiles[trimmed]) { alert(`已存在名为 "${trimmed}" 的配置档案。`); return; }
+    store.profiles[trimmed] = formToProfile();
+    store.active_profile = trimmed;
+    writeStore(store);
+    refreshProfileSelect();
+  });
+  profileRenameBtn.addEventListener('click', () => {
+    const store = readStore();
+    if (!store) return;
+    const old = store.active_profile;
+    const name = prompt(`重命名 "${old}" 为：`, old);
+    if (!name || !name.trim() || name.trim() === old) return;
+    const trimmed = name.trim();
+    if (store.profiles[trimmed]) { alert(`已存在名为 "${trimmed}" 的配置档案。`); return; }
+    store.profiles[trimmed] = store.profiles[old];
+    delete store.profiles[old];
+    store.active_profile = trimmed;
+    writeStore(store);
+    refreshProfileSelect();
+  });
+  profileDeleteBtn.addEventListener('click', () => {
+    const store = readStore();
+    if (!store) return;
+    const cur = store.active_profile;
+    const names = Object.keys(store.profiles);
+    if (names.length <= 1) { alert('至少需要保留一个配置档案。'); return; }
+    if (!confirm(`确定删除配置档案 "${cur}"？\n该档案的服务器凭据与匹配选项将被清除。`)) return;
+    delete store.profiles[cur];
+    store.active_profile = names.filter((n) => n !== cur)[0];
+    writeStore(store);
+    profileToForm(store.profiles[store.active_profile] || {});
+    refreshProfileSelect();
+  });
+
   connectBtn.addEventListener('click', async () => {
+    saveSettings();  // 用户点了连接即认为凭据值得记忆
     const data = await postJSON('/api/connect', {
       url: urlEl.value, username: userEl.value, password: passEl.value,
     });
@@ -308,9 +495,12 @@ pre {
       document.querySelectorAll('.seg-btn').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       state.matchMode = btn.dataset.mode;
+      saveSettings();
     }));
 
-  createPlEl.addEventListener('change', updateUI);
+  playlistInputEl.addEventListener('input', updateUI);
+  createPlEl.addEventListener('change', () => { updateUI(); saveSettings(); });
+  makePublicEl.addEventListener('change', () => { updateUI(); saveSettings(); });
   resultFileEl.addEventListener('change', updateUI);
 
   startBtn.addEventListener('click', async () => {
@@ -330,7 +520,7 @@ pre {
     fd.append('create_on_server', String(createPlEl.checked));
     fd.append('make_public', String(makePublicEl.checked));
     if (currentSource() === 'url_id') {
-      fd.append('playlist_input', playlistInputEl.value.trim());
+      fd.append('playlist_input', playlistInputEl.value);
     } else {
       const f = resultFileEl.files[0];
       if (f) fd.append('result_file', f);
@@ -366,6 +556,7 @@ pre {
   });
   es.addEventListener('done', () => { refreshStatus(); });
 
+  loadSettings();       // 回填已记忆的服务器设置与匹配选项（不自动连接）
   refreshStatus();
   setInterval(refreshStatus, 5000);
 })();

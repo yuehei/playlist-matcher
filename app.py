@@ -45,6 +45,19 @@ def job_running():
     return state.job_thread is not None and state.job_thread.is_alive()
 
 
+def _result_file_exists(path):
+    """检查结果文件是否存在。批量模式下 path 是基础名（无序号），实际文件为 base_N.txt。
+    即使某个歌单失败未生成文件，只要存在任意 base_N.txt 即认为有结果。"""
+    if not path:
+        return False
+    if os.path.exists(path):
+        return True
+    # 批量模式：检查是否存在任意 base_N.txt（非连续也支持）
+    base, _ = os.path.splitext(path)
+    import glob
+    return len(glob.glob(f"{base}_*.txt")) > 0
+
+
 def error_response(message, status=400):
     return jsonify({'ok': False, 'error': message}), status
 
@@ -72,7 +85,7 @@ def api_status():
         'library_count': len(state.library_data),
         'job_running': job_running(),
         'job_kind': state.job_kind if job_running() else None,
-        'has_result': bool(state.last_result_file and os.path.exists(state.last_result_file)),
+        'has_result': _result_file_exists(state.last_result_file),
         'version': core.APP_VERSION,
     })
 
@@ -213,8 +226,10 @@ def api_match():
     state.last_result_file = os.path.abspath(output_path)
 
     core.log_queue.put("开始匹配与创建过程...")
+    # url_id 模式走批量入口（单行也兼容，内部按行拆分）；file 模式走单歌单入口
+    target_func = core.run_batch_matching_process if input_type == 'url_id' else core.run_matching_process
     t = threading.Thread(
-        target=core.run_matching_process,
+        target=target_func,
         args=(navidrome_config, input_type, playlist_input, output_path,
               create_on_server, make_public, match_mode, state.library_data),
         daemon=True,
@@ -228,8 +243,22 @@ def api_match():
 @app.route('/api/result/download')
 def api_result_download():
     path = state.last_result_file
-    if not path or not os.path.exists(path):
+    if not path or not _result_file_exists(path):
         return error_response('暂无可下载的结果文件。', 404)
+    # 批量模式下 path 是基础名（无序号），实际文件为 base_1.txt、base_2.txt...
+    # 优先用 path 本身；不存在则从所有带序号的文件中选序号最大的（容忍中间失败）
+    if not os.path.exists(path):
+        import glob, re
+        base, _ = os.path.splitext(path)
+        candidates = []
+        for p in glob.glob(f"{base}_*.txt"):
+            m = re.search(r'_(\d+)\.txt$', p)
+            if m:
+                candidates.append((int(m.group(1)), p))
+        if not candidates:
+            return error_response('暂无可下载的结果文件。', 404)
+        candidates.sort(key=lambda x: x[0])
+        path = candidates[-1][1]
     return send_file(path, as_attachment=True, download_name=os.path.basename(path))
 
 
