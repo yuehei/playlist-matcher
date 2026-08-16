@@ -55,6 +55,11 @@ ncm_track_cache = {}
 log_queue = queue.Queue()
 unmatched_queue = queue.Queue()
 gui_alert_queue = queue.Queue()
+
+# 最近一次运行的完整未匹配列表（"标题 - 歌手" 字符串，含分段头）。
+# SSE 推送大批量 unmatched 事件不可靠（连接抖动/重连会丢），前端在 done 时
+# 通过 /api/unmatched 拉取此列表作为权威渲染来源。
+last_unmatched_lines = []
 logger = logging.getLogger('PlaylistMatchGUI_Navidrome')
 logger.setLevel(logging.INFO)
 if logger.hasHandlers(): logger.handlers.clear()
@@ -257,27 +262,16 @@ def delete_navidrome_playlist(playlist_id, navidrome_config, file_logger):
 
 def create_navidrome_playlist(name, is_public, navidrome_config, file_logger):
     log_message('info', f"正在创建 Navidrome 歌单: '{name}' (公开: {is_public})...", file_logger)
+    # 显式传递 public 参数：不勾选时设为 false，避免 Navidrome 使用服务端默认值（可能是公开）
+    create_params = {'name': name, 'public': 'true' if is_public else 'false'}
     response_data = call_navidrome_api(
-        "createPlaylist", {'name': name},
+        "createPlaylist", create_params,
         navidrome_config['url'], navidrome_config['username'], navidrome_config['password'],
         file_logger
     )
     if response_data and 'playlist' in response_data:
         new_playlist_id = response_data['playlist'].get('id')
-        log_message('info', f"成功创建 Navidrome 歌单 '{name}' (ID: {new_playlist_id})", file_logger)
-
-        if is_public:
-            log_message('info', f"尝试将歌单 (ID: {new_playlist_id}) 设为公开...", file_logger)
-            update_params = {'playlistId': new_playlist_id, 'public': 'true'}
-            update_response = call_navidrome_api(
-                "updatePlaylist", update_params,
-                navidrome_config['url'], navidrome_config['username'], navidrome_config['password'],
-                file_logger
-            )
-            if update_response and update_response.get('status') == 'ok':
-                log_message('info', f"成功将歌单 (ID: {new_playlist_id}) 设为公开。", file_logger)
-            else:
-                log_message('warning', f"将歌单 (ID: {new_playlist_id}) 设为公开失败。", file_logger)
+        log_message('info', f"成功创建 Navidrome 歌单 '{name}' (ID: {new_playlist_id}, 公开: {is_public})", file_logger)
         return new_playlist_id
     else:
         log_message('error', f"创建 Navidrome 歌单 '{name}' 失败。", file_logger)
@@ -815,6 +809,7 @@ def parse_playlist_input(input_str, file_logger):
 
     ncm_patterns = [
         r"music\.163\.com.*[/#\?]id=(\d+)", r"music\.163\.com/playlist/(\d+)",
+        r"music\.163\.com.*/playlist.*[?&]id=(\d+)",  # SPA URL: /#/playlist?...&id=xxx
         r"y\.music\.163\.com/m/playlist\?id=(\d+)", r"^(\d{8,12})$"
     ]
     for pattern in ncm_patterns:
@@ -1049,15 +1044,21 @@ def _process_single_playlist(candidate, navidrome_library_index, navidrome_confi
         if unmatched_songs_list:
             unmatched_list_str += f"\n未匹配成功的 {playlist_type_for_summary.upper()} 歌曲列表 ({unmatched_count} 首):\n"
             unmatched_queue.put("--- 未匹配歌曲 ---")
+            last_unmatched_lines.append("--- 未匹配歌曲 ---")
             for i, track in enumerate(unmatched_songs_list):
                 track_title = track.get('title', '未知标题')
                 track_artist = track.get('artist', '未知歌手')
                 track_id = track.get('source_id', '未知ID')
                 unmatched_list_str += f"  {i+1}. '{track_title}' by '{track_artist}' (ID: {track_id})\n"
-                unmatched_queue.put(f"{track_title} - {track_artist}")
+                _line = f"{track_title} - {track_artist}"
+                unmatched_queue.put(_line)
+                last_unmatched_lines.append(_line)
+            log_message('info', f"[DEBUG-PUT] unmatched_queue 已放入 {len(unmatched_songs_list)} 条未匹配歌曲", file_logger, to_gui=True)
         else:
             unmatched_queue.put("--- 未匹配歌曲 ---")
             unmatched_queue.put("(无)")
+            last_unmatched_lines.append("--- 未匹配歌曲 ---")
+            last_unmatched_lines.append("(无)")
 
         matched_list_str = ""
         if matched_tracks:
@@ -1109,6 +1110,7 @@ def run_matching_process(navidrome_config, playlist_input_type, playlist_input_d
         log_queue.put(PROCESS_COMPLETE_SENTINEL)
         return
     try:
+        last_unmatched_lines.clear()
         log_message('info', "="*30, file_logger, to_gui=True)
         log_message('info', f"歌单匹配与创建器 (Navidrome) - 版本 {APP_VERSION}", file_logger, to_gui=True)
         log_message('info', f"服务器操作选项: {'启用' if create_playlist_on_server else '禁用'}", file_logger, to_gui=True)
@@ -1169,6 +1171,7 @@ def run_batch_matching_process(navidrome_config, playlist_input_type, playlist_i
         log_queue.put(PROCESS_COMPLETE_SENTINEL)
         return
     try:
+        last_unmatched_lines.clear()
         log_message('info', "="*30, file_logger, to_gui=True)
         log_message('info', f"歌单匹配与创建器 (Navidrome) - 版本 {APP_VERSION} (批量模式)", file_logger, to_gui=True)
         log_message('info', f"服务器操作选项: {'启用' if create_playlist_on_server else '禁用'}", file_logger, to_gui=True)

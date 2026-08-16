@@ -91,12 +91,28 @@ def api_status():
 
 
 # --- Navidrome 连接 ---
+@app.route('/api/disconnect', methods=['POST'])
+def api_disconnect():
+    """清除后端连接状态与媒体库数据。
+    用于切换 profile 时强制重置，避免上一个 profile 的凭据/库数据被新 profile 复用。"""
+    if job_running():
+        return error_response('有任务正在运行，请稍后再试。', 409)
+    state.navidrome_config = None
+    state.server_connected = False
+    state.server_version = "N/A"
+    state.library_data = []
+    return jsonify({'ok': True})
+
+
 @app.route('/api/connect', methods=['POST'])
 def api_connect():
     if job_running():
         return error_response('有任务正在运行，请稍后再试。', 409)
     data = request.get_json(silent=True) or {}
     url = (data.get('url') or '').strip().rstrip('/')
+    # 容忍不带 scheme 的输入（如 192.168.1.100:4533）：缺少 http:// 时 urljoin 会丢掉 host
+    if url and not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
     username = (data.get('username') or '').strip()
     password = data.get('password') or ''
     if not (url and username and password):
@@ -240,6 +256,14 @@ def api_match():
     return jsonify({'ok': True})
 
 
+@app.route('/api/unmatched')
+def api_unmatched():
+    """返回最近一次运行的完整未匹配列表（权威来源）。
+    SSE 对大批量 unmatched 事件的推送不可靠（连接抖动/重连丢事件），
+    前端在 done 时拉取此接口完整重渲染未匹配区。"""
+    return jsonify({'lines': core.last_unmatched_lines})
+
+
 @app.route('/api/result/download')
 def api_result_download():
     path = state.last_result_file
@@ -269,25 +293,36 @@ def _sse(event, data):
 
 def _event_stream():
     last_heartbeat = time.time()
+    unmatched_sent = 0
+    print("[SSE] _event_stream 新连接启动", flush=True)
     while True:
         emitted = False
+        done_this_iter = False
         try:
             while True:
                 msg = core.log_queue.get_nowait()
                 if msg == core.PROCESS_COMPLETE_SENTINEL:
+                    print(f"[SSE] 收到 SENTINEL (此刻前 unmatched_sent={unmatched_sent})，即将 yield done", flush=True)
                     yield _sse('done', {'job_kind': state.job_kind})
+                    done_this_iter = True
                 else:
                     yield _sse('log', {'message': msg})
                 emitted = True
         except queue.Empty:
             pass
+        unmatched_before = unmatched_sent
         try:
             while True:
                 msg = core.unmatched_queue.get_nowait()
                 yield _sse('unmatched', {'message': msg})
+                unmatched_sent += 1
                 emitted = True
         except queue.Empty:
             pass
+        if unmatched_sent > unmatched_before:
+            print(f"[SSE] 本轮 unmatched 发送 {unmatched_sent - unmatched_before} 条，累计 {unmatched_sent}", flush=True)
+        if done_this_iter:
+            print(f"[SSE] done 所在迭代结束，累计 unmatched_sent={unmatched_sent}", flush=True)
         try:
             while True:
                 alert_type, title, message = core.gui_alert_queue.get_nowait()
@@ -315,7 +350,7 @@ def api_events():
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
-    port = int(os.environ.get('PORT', '5000'))
+    port = int(os.environ.get('PORT', '5055'))
     url = f"http://127.0.0.1:{port}"
     print(f"启动 {core.APP_NAME} v{core.APP_VERSION}，访问 {url}")
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()

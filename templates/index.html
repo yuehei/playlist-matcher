@@ -265,6 +265,8 @@ pre {
       match_mode: state.matchMode,
       create_on_server: createPlEl.checked,
       make_public: makePublicEl.checked,
+      playlist_input: playlistInputEl.value,
+      source: currentSource(),
     };
   }
 
@@ -277,6 +279,12 @@ pre {
     else userEl.value = '';
     if (typeof p.navidrome_password === 'string') passEl.value = p.navidrome_password;
     else passEl.value = '';
+    playlistInputEl.value = (typeof p.playlist_input === 'string') ? p.playlist_input : '';
+    // 源模式回填（默认 url_id）
+    const src = (p.source === 'file') ? 'file' : 'url_id';
+    document.querySelectorAll('input[name="src"]').forEach((r) => {
+      r.checked = (r.value === src);
+    });
     const mm = (p.match_mode === '完全匹配') ? '完全匹配' : '模糊匹配';
     state.matchMode = mm;
     document.querySelectorAll('.seg-btn').forEach((b) => {
@@ -321,6 +329,8 @@ pre {
     writeStore(store);
     profileToForm(store.profiles[name]);
     refreshProfileSelect();
+    // 切换 profile 必须重置后端连接状态：避免旧凭据/库数据被新 profile 复用
+    postJSON('/api/disconnect', {}).catch(() => {}).finally(refreshStatus);
   }
 
   // 页面加载时初始化 profile：若无存储则创建 default
@@ -488,7 +498,7 @@ pre {
   });
 
   document.querySelectorAll('input[name="src"]').forEach((r) =>
-    r.addEventListener('change', updateUI));
+    r.addEventListener('change', () => { updateUI(); saveSettings(); }));
 
   document.querySelectorAll('.seg-btn').forEach((btn) =>
     btn.addEventListener('click', () => {
@@ -498,7 +508,7 @@ pre {
       saveSettings();
     }));
 
-  playlistInputEl.addEventListener('input', updateUI);
+  playlistInputEl.addEventListener('input', () => { updateUI(); saveSettings(); });
   createPlEl.addEventListener('change', () => { updateUI(); saveSettings(); });
   makePublicEl.addEventListener('change', () => { updateUI(); saveSettings(); });
   resultFileEl.addEventListener('change', updateUI);
@@ -548,13 +558,35 @@ pre {
 
   // --- SSE ---
   const es = new EventSource('/api/events');
+  let unmatchedRecv = 0;
+  es.addEventListener('open', () => console.log('[FE] EventSource open'));
+  es.addEventListener('error', () => console.log('[FE] EventSource error, readyState=', es.readyState));
   es.addEventListener('log', (e) => appendLine(logArea, JSON.parse(e.data).message));
-  es.addEventListener('unmatched', (e) => appendLine(unmatchedArea, JSON.parse(e.data).message));
+  es.addEventListener('unmatched', (e) => {
+    unmatchedRecv += 1;
+    if (unmatchedRecv % 50 === 0 || unmatchedRecv <= 3) console.log('[FE] unmatched received #', unmatchedRecv);
+    appendLine(unmatchedArea, JSON.parse(e.data).message);
+  });
   es.addEventListener('alert', (e) => {
     const a = JSON.parse(e.data);
     alert(`${a.title}\n\n${a.message}`);
   });
-  es.addEventListener('done', () => { refreshStatus(); });
+  es.addEventListener('done', async () => {
+    console.log('[FE] done received, unmatched SSE-received =', unmatchedRecv);
+    // SSE 推送大批量 unmatched 不可靠（丢事件/重连），以 /api/unmatched 为权威来源完整重渲染
+    try {
+      const res = await fetch('/api/unmatched');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.lines)) {
+          unmatchedArea.textContent = data.lines.length ? (data.lines.join('\n') + '\n') : '';
+          unmatchedArea.scrollTop = unmatchedArea.scrollHeight;
+          console.log('[FE] unmatched authoritative count =', data.lines.length);
+        }
+      }
+    } catch (e) { /* 拉取失败则保留 SSE 已渲染内容 */ }
+    refreshStatus();
+  });
 
   loadSettings();       // 回填已记忆的服务器设置与匹配选项（不自动连接）
   refreshStatus();
