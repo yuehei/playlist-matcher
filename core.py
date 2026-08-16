@@ -957,6 +957,22 @@ def _process_single_playlist(candidate, navidrome_library_index, navidrome_confi
                 return result
 
             source_song_list_valid = [s for s in source_song_list if s and s.get('title')]
+            raw_total_songs = len(source_song_list_valid)
+            # 源歌单可能含重复条目（同一歌曲 ID 多次出现，如 QQ 歌单里同一首歌列 5 次），
+            # 按 source_id 去重，否则 total_songs/matched_count 会把重复算进去，
+            # 与实际写入歌单数（按 Navidrome ID 去重）不一致，看着像"少写了歌"。
+            _seen_ids = set()
+            _deduped = []
+            for s in source_song_list_valid:
+                sid = s.get('source_id')
+                if sid in _seen_ids:
+                    continue
+                _seen_ids.add(sid)
+                _deduped.append(s)
+            dup_count = raw_total_songs - len(_deduped)
+            if dup_count > 0:
+                log_message('info', f"源歌单含 {dup_count} 首重复歌曲（同一 ID），已按 ID 去重：{raw_total_songs} → {len(_deduped)} 首。", file_logger, to_gui=True)
+            source_song_list_valid = _deduped
             total_songs = len(source_song_list_valid)
             log_message('info', f"\n开始使用索引进行快速匹配 {total_songs} 首源歌曲...", file_logger, to_gui=True)
             if match_mode == "模糊匹配":
@@ -984,6 +1000,10 @@ def _process_single_playlist(candidate, navidrome_library_index, navidrome_confi
         unmatched_songs_list = list(unmatched_source_songs_dict.values())
         matched_count = len(matched_tracks)
         unmatched_count = len(unmatched_songs_list)
+        # 按 Navidrome 歌曲 ID 去重后的唯一歌曲数（实际写入歌单的数量）。
+        # 多个源歌曲可能映射到同一首 Navidrome 歌曲（如翻唱/混音版匹配到同一曲目），
+        # 写入歌单时必须去重，否则会与"成功匹配数 (映射关系)"不一致。
+        unique_matched_count = len(set(t.get('id') for t in matched_tracks if t.get('id')))
         server_op_status = "未执行 (选项未启用或无匹配歌曲)"
 
         if create_playlist_on_server and matched_count > 0:
@@ -1006,9 +1026,18 @@ def _process_single_playlist(candidate, navidrome_library_index, navidrome_confi
 
                 new_playlist_id = create_navidrome_playlist(source_playlist_name, make_playlist_public, navidrome_config, file_logger)
                 if new_playlist_id:
-                    unique_ids_to_add = list(set([track['id'] for track in matched_tracks]))
+                    # 按 matched_tracks 的首次出现顺序去重（保留源歌单顺序）。
+                    # 之前用 list(set(...))，set 不保序会导致写入歌单的顺序与源歌单不一致。
+                    _seen_ids = set()
+                    unique_ids_to_add = []
+                    for track in matched_tracks:
+                        tid = track.get('id')
+                        if tid in _seen_ids:
+                            continue
+                        _seen_ids.add(tid)
+                        unique_ids_to_add.append(tid)
                     num_unique_songs_to_add = len(unique_ids_to_add)
-                    log_message('info', f"去重后，准备向歌单添加 {num_unique_songs_to_add} 个唯一的 Navidrome 歌曲ID。", file_logger, to_gui=True)
+                    log_message('info', f"去重后，准备向歌单添加 {num_unique_songs_to_add} 个唯一的 Navidrome 歌曲ID（按源歌单顺序）。", file_logger, to_gui=True)
                     if num_unique_songs_to_add > 0:
                         if add_songs_to_navidrome_playlist_batched(new_playlist_id, unique_ids_to_add, navidrome_config, file_logger):
                             server_op_status = f"成功 (创建/更新歌单 ID: {new_playlist_id}, 添加 {num_unique_songs_to_add} 首歌)"
@@ -1034,6 +1063,7 @@ def _process_single_playlist(candidate, navidrome_library_index, navidrome_confi
 源歌单名称: '{source_playlist_name}' ({playlist_type_for_summary.upper()} ID: {playlist_id_for_summary or '未知'})
 歌单总曲数: {total_songs}
 成功匹配数 (映射关系): {matched_count}
+去重后唯一 Navidrome 歌曲: {unique_matched_count}（实际写入歌单数）
 未匹配数: {unmatched_count}
 """
         if total_songs > 0: summary += f"匹配率: {matched_count / total_songs:.2%}\n"

@@ -509,6 +509,9 @@ pre {
     }));
 
   playlistInputEl.addEventListener('input', () => { updateUI(); saveSettings(); });
+  // 服务器地址/用户名/密码改动即时持久化：否则这些字段只在"连接"或切换 profile 时才保存，
+  // 刷新页面或切换 profile 前若未触发 saveSettings，新输入的凭据会丢失，导致 profile 数据陈旧、切换后看似"没切对"。
+  [urlEl, userEl, passEl].forEach((el) => el.addEventListener('input', saveSettings));
   createPlEl.addEventListener('change', () => { updateUI(); saveSettings(); });
   makePublicEl.addEventListener('change', () => { updateUI(); saveSettings(); });
   resultFileEl.addEventListener('change', updateUI);
